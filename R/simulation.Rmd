@@ -1,11 +1,12 @@
 ---
 title: "The Trouts of Trondheim"
 output: html_notebook
+author: ChatGPT
 ---
 
-This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+Based on: Sara Lutro’s 2025 MSc thesis “Trophically transmitted parasites as indicators for resource use in sea trout”
 
-Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+Can you author an R program that simulates the data generating process (DGP)? A simplified model is fine but obviously we will want: a- prey_abundance: Abundance of prey in Trondheimsfjorden for trout to eat--we can collapse the variations for now in the intitial DGP. b- prey_parasite_load: How full of parasites are the prey animals? Simplified for now to pool across all types of prey
 
 ```{r}
 # -----------------------------
