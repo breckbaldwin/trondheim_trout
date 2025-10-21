@@ -276,6 +276,59 @@ print(chk)
 
 ```
 
+Can we recover the parameters?
+
+```{r}
+# If not already loaded:
+library(MASS); library(dplyr)
+
+# ---- known from your simulator ----
+parasite_survival <- params$parasite_survival   # e.g., 0.98
+accum_factor <- function(w, s) ifelse(w <= 0, 0, (1 - s^w) / (1 - s))
+
+# Ensure predictors are present (your sim had these already)
+stopifnot(all(c("z_length","mean_prey_abundance",
+                "mean_prey_parasite_load","exposure_days",
+                "total_parasites","year") %in% names(sim_df)))
+
+# Build the offset: log( mean_pl * accumulation_sum )
+sim_df <- sim_df %>%
+  mutate(
+    offset_term = log(pmax(mean_prey_parasite_load, 1e-12)) +
+                  log(pmax(accum_factor(exposure_days, parasite_survival), 1e-12)),
+    log_mean_abund = log(pmax(mean_prey_abundance, 1e-12))
+  )
+
+# Fit NegBin regression; year as a factor optionally soaks up year-level shifts
+fit_nb <- glm.nb(
+  total_parasites ~ z_length + log_mean_abund + factor(year) + offset(offset_term),
+  data = sim_df
+)
+
+summary(fit_nb)
+fit_nb$theta           # estimated overdispersion size (k_hat)
+
+```
+Now we compare with the starting parameterization:
+
+```{r}
+# Compare to truth
+truth <- c(
+  beta_len_ingest   = params$beta_len_ingest,    # ~ 0.25
+  beta_abund_ingest = params$beta_abund_ingest,  # ~ 0.80
+  beta0_plus_logq   = params$beta0_ingest + log(params$transmission_q),  # ~ -0.2 + log(0.6)
+  size_k            = params$nb_size_k           # ~ 5
+)
+est <- c(
+  beta_len_ingest   = coef(fit_nb)["z_length"],
+  beta_abund_ingest = coef(fit_nb)["log_mean_abund"],
+  beta0_plus_logq   = coef(fit_nb)["(Intercept)"],
+  size_k            = fit_nb$theta
+)
+rbind(truth, est)
+
+```
+
 Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
 
 When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file). 
