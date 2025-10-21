@@ -1,0 +1,284 @@
+---
+title: "The Trouts of Trondheim"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+```{r}
+# -----------------------------
+# Sea trout parasite DGP (R)
+# -----------------------------
+# Simulates a simplified mechanistic process:
+#   environment: prey_abundance(t, year), prey_parasite_load(t, year)
+#   fish: length, entry_day, capture_day
+#   process: daily ingestion  ~ f(length, prey_abundance)
+#            daily parasite exposure ~ ingestion * prey_parasite_load
+#            accumulation with per-day survival
+#   observation: total parasites ~ NegBin(mean = accumulated_exposure, size = k)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+})
+
+set.seed(42)
+
+# -----------------------------
+# Tunable Parameters
+# -----------------------------
+params <- list(
+  years              = c(2015, 2021),
+  season_start       = 140,        # Julian day ~ May 20
+  season_end         = 221,        # Julian day ~ Aug 9
+  n_fish_per_year    = 30,
+  # environment process (log scale means for LN; seasonality add-on)
+  log_mu_abund       = c(`2015` = log(1.0), `2021` = log(1.1)), # year mean shifts
+  log_sd_abund       = 0.5,        # day-to-day environmental variability
+  log_mu_pl          = c(`2015` = log(0.20), `2021` = log(0.25)), # parasite load shift
+  log_sd_pl          = 0.35,
+  season_amp_abund   = 0.35,       # amplitude of sinusoid for abundance
+  season_amp_pl      = 0.20,       # amplitude for parasite load
+  season_phase       = 0.0,        # phase shift for both signals
+  # fish traits
+  len_mu             = c(`2015` = 460, `2021` = 520),  # mm
+  len_sd             = 85,
+  min_days_at_sea    = 10,         # minimum days before capture (exposure window)
+  # ingestion & accumulation
+  beta0_ingest       = -0.2,       # baseline log-ingestion
+  beta_len_ingest    = 0.25,       # effect of z-scored length on ingestion
+  beta_abund_ingest  = 0.80,       # effect of log(prey_abundance) on ingestion
+  # transmission scaling (parasites per 'unit ingestion' per unit parasite-load)
+  transmission_q     = 0.6,
+  # parasite survival per day (in-host)
+  parasite_survival  = 0.98,       # s in (0,1); 0.98 ~ long-lived
+  # NegBin overdispersion: size=k (larger k => less overdispersion)
+  nb_size_k          = 5
+)
+
+# -----------------------------
+# Utilities
+# -----------------------------
+inv_logit <- function(x) 1 / (1 + exp(-x))
+
+# make a tidy season grid for each year with daily environment
+simulate_environment <- function(p = params) {
+  season_days <- seq(p$season_start, p$season_end)
+  expand.grid(year = p$years, day = season_days) %>%
+    as_tibble() %>%
+    group_by(year) %>%
+    mutate(
+      # seasonal cycles (scaled to mean 0)
+      s_term = sin(2*pi*(day - p$season_start)/(p$season_end - p$season_start) + p$season_phase),
+      # prey abundance (lognormal)
+      log_abund_mean = p$log_mu_abund[as.character(year)] + p$season_amp_abund * s_term,
+      prey_abundance = rlnorm(n(), meanlog = log_abund_mean, sdlog = p$log_sd_abund),
+      # prey parasite load (lognormal)
+      log_pl_mean    = p$log_mu_pl[as.character(year)] + p$season_amp_pl * s_term,
+      prey_parasite_load = rlnorm(n(), meanlog = log_pl_mean, sdlog = p$log_sd_pl)
+    ) %>%
+    ungroup()
+}
+
+# simulate fish captures and lengths
+simulate_fish_1 <- function(env_df, p = params) {
+  fish <- env_df %>%
+    group_by(year) %>%
+    summarise(day_min = min(day), day_max = max(day), .groups="drop") %>%
+    rowwise() %>%
+    mutate(
+      n_fish = p$n_fish_per_year,
+      fish_id = list(seq_len(n_fish))
+    ) %>%
+    ungroup() %>%
+    select(year, day_min, day_max) %>%
+    uncount(weights = p$n_fish_per_year, .remove = FALSE) %>%
+    group_by(year) %>%
+    mutate(
+      fish_id = paste0(year, "_", row_number()),
+      length  = rnorm(n(), mean = p$len_mu[as.character(unique(year))], sd = p$len_sd),
+      capture_day = sample(seq(day_min + p$min_days_at_sea, day_max), size = n(), replace = TRUE),
+      entry_day   = pmax(capture_day - sample(seq(p$min_days_at_sea, 35), size = n(), replace = TRUE),
+                         day_min)
+    ) %>%
+    ungroup() %>%
+    select(fish_id, year, length, entry_day, capture_day)
+  fish
+}
+
+simulate_fish_2 <- function(env_df, p = params) {
+  # per-year day bounds
+  bounds <- env_df %>%
+    dplyr::group_by(year) %>%
+    dplyr::summarise(
+      day_min = min(day),
+      day_max = max(day),
+      .groups = "drop"
+    )
+
+  # build fish rows per year
+  fish <- bounds %>%
+    dplyr::group_by(year) %>%
+    dplyr::group_modify(~{
+      yr <- .x$year[1]
+      n  <- p$n_fish_per_year
+      dmin <- .x$day_min[1]
+      dmax <- .x$day_max[1]
+
+      # sample capture day ensuring at least min_days_at_sea exposure
+      cap <- sample(seq(dmin + p$min_days_at_sea, dmax), size = n, replace = TRUE)
+
+      # random exposure window length (min_days_at_sea .. 35), truncated to season start
+      expo_len <- sample(seq(p$min_days_at_sea, 35), size = n, replace = TRUE)
+      ent <- pmax(cap - expo_len, dmin)
+
+      tibble::tibble(
+        fish_id     = sprintf("%d_%03d", yr, seq_len(n)),
+        year        = yr,
+        length      = rnorm(n, mean = p$len_mu[as.character(yr)], sd = p$len_sd),
+        entry_day   = ent,
+        capture_day = cap
+      )
+    }) %>%
+    dplyr::ungroup()
+
+  fish
+}
+
+
+# (Optional but recommended) make sure the named vectors really have year names
+names(params$len_mu)        <- as.character(params$years)
+names(params$log_mu_abund)  <- as.character(params$years)
+names(params$log_mu_pl)     <- as.character(params$years)
+
+# Safe simulate_fish(): no group_modify, no rowwise, no uninitialised columns
+simulate_fish <- function(env_df, p = params) {
+  yrs <- sort(unique(env_df$year))
+  out_list <- lapply(yrs, function(yr) {
+    sub <- env_df[env_df$year == yr, , drop = FALSE]
+    if (nrow(sub) == 0) stop("No environment rows for year: ", yr)
+
+    dmin <- min(sub$day); dmax <- max(sub$day)
+    n    <- p$n_fish_per_year
+
+    # capture day ensures at least min_days_at_sea of exposure
+    cap  <- sample(seq(dmin + p$min_days_at_sea, dmax), size = n, replace = TRUE)
+    expo_len <- sample(p$min_days_at_sea:35, size = n, replace = TRUE)
+    ent  <- pmax(cap - expo_len, dmin)
+
+    # robust mean lookup; fallback to overall mean if name missing
+    len_mean <- p$len_mu[[as.character(yr)]]
+    if (is.null(len_mean) || is.na(len_mean)) {
+      len_mean <- mean(unlist(p$len_mu))
+    }
+
+    tibble::tibble(
+      fish_id     = sprintf("%d_%03d", yr, seq_len(n)),
+      year        = as.integer(yr),
+      length      = stats::rnorm(n, mean = len_mean, sd = p$len_sd),
+      entry_day   = ent,
+      capture_day = cap
+    )
+  })
+
+  dplyr::bind_rows(out_list)
+}
+
+
+# compute accumulation factor sum_{k=0}^{w-1} s^k = (1 - s^w)/(1 - s)
+accum_factor <- function(w, s) ifelse(w <= 0, 0, (1 - s^w) / (1 - s))
+
+# main simulator
+simulate_parasites <- function(env_df, fish_df, p = params) {
+  # standardize length within all fish for ingestion effect
+  zlen <- scale(fish_df$length)[,1]
+  fish_df$z_length <- as.numeric(zlen)
+
+  # join each fish with its environmental exposure window
+  fish_exposure <- fish_df %>%
+    rowwise() %>%
+    mutate(
+      days_seq = list(seq(entry_day, capture_day)),
+      window   = length(days_seq)
+    ) %>%
+    ungroup() %>%
+    tidyr::unnest(cols = c(days_seq), names_repair = "check_unique") %>%
+    rename(day = days_seq) %>%
+    left_join(env_df, by = c("year", "day"))
+
+  # ingestion rate per day (log-link)
+  fish_exposure <- fish_exposure %>%
+    mutate(
+      log_ingest = p$beta0_ingest +
+                   p$beta_len_ingest * z_length +
+                   p$beta_abund_ingest * log(pmax(prey_abundance, 1e-8)),
+      ingest     = exp(log_ingest),
+      # daily expected parasites entering host
+      daily_exposure = ingest * prey_parasite_load * p$transmission_q,
+      # lag from day to capture (0 at capture_day, grows back in time)
+      lag_to_capture = capture_day - day,
+      # survival-weighted contribution
+      daily_contribution = daily_exposure * (p$parasite_survival ^ lag_to_capture)
+    )
+
+  # aggregate to fish-level expected count
+  fish_mu <- fish_exposure %>%
+    group_by(fish_id, year, length, z_length, entry_day, capture_day) %>%
+    summarise(
+      exposure_days = n(),
+      mu = sum(daily_contribution),
+      mean_prey_abundance = mean(prey_abundance),
+      mean_prey_parasite_load = mean(prey_parasite_load),
+      .groups = "drop"
+    )
+
+  # sample NegBin (size=k, mean=mu)
+  # rnbinom parametrization: size=k, mu=mu  -> variance = mu + mu^2/k
+  k <- params$nb_size_k
+  fish_mu$total_parasites <- rnbinom(nrow(fish_mu), size = k, mu = pmax(fish_mu$mu, 1e-8))
+
+  fish_mu
+}
+
+# -----------------------------
+# Run the simulation
+# -----------------------------
+env_df  <- simulate_environment(params)
+fish_df <- simulate_fish(env_df, params)
+sim_df  <- simulate_parasites(env_df, fish_df, params)
+
+# -----------------------------
+# Outputs
+# -----------------------------
+# 1) Fish-level dataset (analysis-ready)
+sim_df %>% arrange(year, capture_day) %>% print(n = 10)
+
+# 2) Environment time series (for plotting/diagnostics)
+# env_df %>% head()
+
+# -----------------------------
+# Minimal sanity checks
+# -----------------------------
+message("\nSanity checks:")
+chk <- sim_df %>%
+  group_by(year) %>%
+  summarise(
+    cor_len_parasites   = cor(length, total_parasites),
+    cor_day_parasites   = cor(capture_day, total_parasites),
+    mean_parasites      = mean(total_parasites),
+    mean_mu             = mean(mu),
+    .groups = "drop"
+  )
+print(chk)
+
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file). 
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+
